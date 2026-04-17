@@ -1,11 +1,12 @@
 from functools import wraps
 import os
 import sqlite3
+import re
 from datetime import datetime
 import requests
 import tempfile
 import whisper
-import subprocess
+import traceback
 
 from flask import (
     Flask,
@@ -28,10 +29,37 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignat
 
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
+from twilio.base.exceptions import TwilioRestException
 import assemblyai as aai
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# ------------------------------
+# Helper: normalize phone to E.164
+# ------------------------------
+def normalize_phone(phone: str) -> str:
+    """Convert local/international numbers to E.164 format (+962...)."""
+    if not phone:
+        return ""
+    # Remove all non-digit characters
+    digits = re.sub(r"\D", "", phone)
+    if not digits:
+        return ""
+    # If already starts with '+' and has 10-15 digits, return as is (basic validation)
+    if phone.startswith("+") and len(digits) >= 10:
+        return phone
+    # Handle 00962... or 962... or 0...
+    if digits.startswith("00962"):
+        digits = digits[2:]  # remove 00 -> +962...
+    elif digits.startswith("962"):
+        digits = "962" + digits[3:] if len(digits) > 3 else digits
+    elif digits.startswith("0"):
+        digits = "962" + digits[1:]  # remove leading 0, add 962
+    else:
+        # Assume it's a local number without country code – add +962
+        digits = "962" + digits
+    return f"+{digits}"
 
 # ------------------------------
 # App Configuration
@@ -56,8 +84,11 @@ app.config["MAIL_DEFAULT_SENDER"] = "ablgah.official@gmail.com"
 # Twilio settings
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+17406658652")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+16062303912")
 SUPPORT_AGENT_NUMBER = os.getenv("SUPPORT_AGENT_NUMBER")
+# Normalize support agent number immediately
+if SUPPORT_AGENT_NUMBER:
+    SUPPORT_AGENT_NUMBER = normalize_phone(SUPPORT_AGENT_NUMBER)
 
 # AssemblyAI (optional fallback)
 AAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
@@ -70,8 +101,10 @@ mail = Mail(app)
 serializer = URLSafeTimedSerializer(app.secret_key)
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
     twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    print("✅ Twilio client initialized")
 else:
     twilio_client = None
+    print("⚠️ Twilio credentials missing - voice features disabled")
 
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
@@ -87,14 +120,13 @@ except Exception as e:
 
 # Helper: transcribe with Whisper
 def transcribe_audio_with_whisper(audio_path):
-    """Transcribe audio using Whisper (supports webm, mp3, wav, etc. if ffmpeg installed)."""
     if whisper_model is None:
         raise Exception("Whisper model not loaded")
     result = whisper_model.transcribe(audio_path, language="ar", fp16=False)
     return result["text"].strip()
 
 # ------------------------------
-# Database Models
+# Database Models (unchanged)
 # ------------------------------
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -174,7 +206,6 @@ def admin_required(view_func):
 
 def get_current_user():
     if "user_id" in session:
-        # Fix deprecation warning
         return db.session.get(User, session["user_id"])
     return None
 
@@ -195,22 +226,14 @@ def classify_problem(transcript):
 @app.context_processor
 def inject_user_preferences():
     user = get_current_user()
-
     unread_support_count = 0
     unread_admin_support_count = 0
-
     if user:
         unread_support_count = SupportMessage.query.filter_by(
-            user_id=user.id,
-            status="تم الرد",
-            is_read=False
+            user_id=user.id, status="تم الرد", is_read=False
         ).count()
-
         if user.email.lower() == ADMIN_EMAIL.lower():
-            unread_admin_support_count = SupportMessage.query.filter_by(
-                status="جديدة"
-            ).count()
-
+            unread_admin_support_count = SupportMessage.query.filter_by(status="جديدة").count()
     return {
         "current_user": user,
         "current_theme": user.theme if user else "light",
@@ -221,7 +244,7 @@ def inject_user_preferences():
     }
 
 # ------------------------------
-# Automatic database column repair (safe version)
+# Database column repair (safe)
 # ------------------------------
 def table_exists(conn, table_name):
     cursor = conn.cursor()
@@ -235,35 +258,24 @@ def ensure_columns():
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-
-        # Report table
         if table_exists(conn, "report"):
             cursor.execute("PRAGMA table_info(report)")
             cols = [c[1] for c in cursor.fetchall()]
             if 'created_at' not in cols:
                 cursor.execute("ALTER TABLE report ADD COLUMN created_at TIMESTAMP")
                 conn.commit()
-                print("✅ Added created_at to report")
-
-        # SupportMessage table
         if table_exists(conn, "support_message"):
             cursor.execute("PRAGMA table_info(support_message)")
             cols = [c[1] for c in cursor.fetchall()]
             if 'created_at' not in cols:
                 cursor.execute("ALTER TABLE support_message ADD COLUMN created_at TIMESTAMP")
                 conn.commit()
-                print("✅ Added created_at to support_message")
-
-        # CallReport table
         if table_exists(conn, "call_report"):
             cursor.execute("PRAGMA table_info(call_report)")
             cols = [c[1] for c in cursor.fetchall()]
             if 'report_type' not in cols:
                 cursor.execute("ALTER TABLE call_report ADD COLUMN report_type VARCHAR(50) NOT NULL DEFAULT ''")
                 conn.commit()
-                print("✅ Added report_type to call_report")
-
-        # EmergencyCall table (always ensure it exists)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS emergency_call (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,9 +295,8 @@ def ensure_columns():
         print(f"Column ensure warning: {e}")
 
 # ------------------------------
-# Routes (all existing routes)
+# All existing routes (unchanged except phone normalization in registration)
 # ------------------------------
-
 @app.route("/")
 def home():
     return render_template("home.html", user=get_current_user())
@@ -298,22 +309,15 @@ def login_page():
 def login():
     identifier = request.form.get("identifier", "").strip()
     password = request.form.get("password", "").strip()
-
     if not identifier or not password:
         flash("يرجى تعبئة جميع الحقول", "error")
         return redirect(url_for("login_page"))
-
-    user = User.query.filter(
-        (User.email == identifier) | (User.phone == identifier)
-    ).first()
-
+    user = User.query.filter((User.email == identifier) | (User.phone == identifier)).first()
     if user is None or not check_password_hash(user.password, password):
         flash("يرجى التاكد من البيانات", "error")
         return redirect(url_for("login_page"))
-
     session["user_id"] = user.id
     session["user_name"] = user.name
-
     flash("تم تسجيل الدخول بنجاح", "success")
     return redirect(url_for("home"))
 
@@ -321,26 +325,18 @@ def login():
 def admin_login():
     identifier = request.form.get("identifier", "").strip()
     password = request.form.get("password", "").strip()
-
     if not identifier or not password:
         flash("يرجى تعبئة جميع الحقول", "error")
         return redirect(url_for("login_page"))
-
-    user = User.query.filter(
-        (User.email == identifier) | (User.phone == identifier)
-    ).first()
-
+    user = User.query.filter((User.email == identifier) | (User.phone == identifier)).first()
     if user is None or not check_password_hash(user.password, password):
         flash("يرجى التاكد من البيانات", "error")
         return redirect(url_for("login_page"))
-
     if user.email.lower() != ADMIN_EMAIL.lower():
         flash("ليس لديك صلاحية أدمن", "error")
         return redirect(url_for("login_page"))
-
     session["user_id"] = user.id
     session["user_name"] = user.name
-
     flash("مرحباً! تم تسجيل دخولك كأدمن", "success")
     return redirect(url_for("home"))
 
@@ -354,38 +350,23 @@ def register():
     email = request.form.get("email", "").strip()
     phone = request.form.get("phone", "").strip()
     password = request.form.get("password", "").strip()
-
     if not name or not email or not phone or not password:
         flash("يرجى تعبئة جميع الحقول", "error")
         return redirect(url_for("register_page"))
-
-    existing_user = User.query.filter_by(email=email).first()
-    if existing_user:
+    # Normalize phone before saving
+    phone = normalize_phone(phone)
+    if User.query.filter_by(email=email).first():
         flash("هذا البريد مسجل من قبل", "error")
         return redirect(url_for("register_page"))
-
-    existing_phone = User.query.filter_by(phone=phone).first()
-    if existing_phone:
+    if User.query.filter_by(phone=phone).first():
         flash("رقم الجوال مسجل من قبل", "error")
         return redirect(url_for("register_page"))
-
     hashed_password = generate_password_hash(password)
     is_admin = (email.lower() == ADMIN_EMAIL.lower())
-
-    new_user = User(
-        name=name,
-        email=email,
-        password=hashed_password,
-        phone=phone,
-        language="العربية",
-        theme="light",
-        avatar="",
-        is_admin=is_admin
-    )
-
+    new_user = User(name=name, email=email, password=hashed_password, phone=phone,
+                    language="العربية", theme="light", avatar="", is_admin=is_admin)
     db.session.add(new_user)
     db.session.commit()
-
     flash("تم إنشاء الحساب بنجاح، يمكنك تسجيل الدخول الآن", "success")
     return redirect(url_for("login_page"))
 
@@ -441,11 +422,8 @@ def reset_password_page(token):
 def reset_password(token):
     try:
         email = serializer.loads(token, salt="reset-password-salt", max_age=3600)
-    except SignatureExpired:
-        flash("انتهت صلاحية رابط إعادة التعيين", "error")
-        return redirect(url_for("forgot_password_page"))
-    except BadTimeSignature:
-        flash("رابط إعادة التعيين غير صالح", "error")
+    except (SignatureExpired, BadTimeSignature):
+        flash("الرابط غير صالح أو منتهي الصلاحية", "error")
         return redirect(url_for("forgot_password_page"))
     password = request.form.get("password", "").strip()
     confirm_password = request.form.get("confirm_password", "").strip()
@@ -483,12 +461,7 @@ def submit_report():
         flash("يرجى تعبئة وصف البلاغ", "error")
         return redirect(url_for("report_page"))
     final_type = report_type if report_type else "عام"
-    new_report = Report(
-        type=final_type,
-        description=description,
-        status="جديد",
-        user_id=session["user_id"]
-    )
+    new_report = Report(type=final_type, description=description, status="جديد", user_id=session["user_id"])
     db.session.add(new_report)
     db.session.commit()
     flash("تم إرسال البلاغ بنجاح", "success")
@@ -514,27 +487,13 @@ def my_reports():
     call_reports = CallReport.query.filter_by(user_id=session["user_id"]).all()
     combined = []
     for r in regular_reports:
-        combined.append({
-            'id': r.id,
-            'type': r.type,
-            'description': r.description,
-            'status': r.status,
-            'created_at': r.created_at,
-            'is_call': False,
-            'call_id': None,
-            'transcript': None
-        })
+        combined.append({'id': r.id, 'type': r.type, 'description': r.description, 'status': r.status,
+                         'created_at': r.created_at, 'is_call': False, 'call_id': None, 'transcript': None})
     for cr in call_reports:
-        combined.append({
-            'id': cr.id,
-            'type': cr.report_type,
-            'description': f"[بلاغ هاتفي] {cr.transcript[:150] if cr.transcript else 'جاري المعالجة...'}",
-            'status': 'جديد',
-            'created_at': cr.created_at,
-            'is_call': True,
-            'call_id': cr.id,
-            'transcript': cr.transcript
-        })
+        combined.append({'id': cr.id, 'type': cr.report_type,
+                         'description': f"[بلاغ هاتفي] {cr.transcript[:150] if cr.transcript else 'جاري المعالجة...'}",
+                         'status': 'جديد', 'created_at': cr.created_at, 'is_call': True,
+                         'call_id': cr.id, 'transcript': cr.transcript})
     combined.sort(key=lambda x: x['created_at'] or datetime.min, reverse=True)
     return render_template("my_reports.html", reports=combined)
 
@@ -545,7 +504,6 @@ def call_report_details(call_id):
     if call_report.user_id != session["user_id"] and not get_current_user().is_admin:
         flash("ليس لديك صلاحية لعرض هذا البلاغ", "error")
         return redirect(url_for("my_reports"))
-
     if not call_report.transcript and call_report.call_sid and twilio_client:
         try:
             recordings = twilio_client.recordings.list(call_sid=call_report.call_sid)
@@ -566,17 +524,12 @@ def call_report_details(call_id):
                         call_report.problem_category = category
                         call_report.status = "transcribed"
                         db.session.commit()
-                        existing = Report.query.filter_by(
-                            user_id=call_report.user_id,
-                            description=f"[مكالمة هاتفية] {transcript[:200]}"
-                        ).first()
+                        existing = Report.query.filter_by(user_id=call_report.user_id,
+                                                          description=f"[مكالمة هاتفية] {transcript[:200]}").first()
                         if not existing:
-                            normal_report = Report(
-                                type=call_report.report_type,
-                                description=f"[مكالمة هاتفية] {transcript[:200]}",
-                                status="جديد",
-                                user_id=call_report.user_id
-                            )
+                            normal_report = Report(type=call_report.report_type,
+                                                   description=f"[مكالمة هاتفية] {transcript[:200]}",
+                                                   status="جديد", user_id=call_report.user_id)
                             db.session.add(normal_report)
                             db.session.commit()
                     except Exception as e:
@@ -585,7 +538,6 @@ def call_report_details(call_id):
                         os.unlink(tmp_path)
         except Exception as e:
             print(f"Error in call-details: {e}")
-
     return render_template("call_details.html", call=call_report)
 
 @app.route("/about")
@@ -651,7 +603,8 @@ def update_profile():
         return redirect(url_for("profile_page"))
     user.name = name
     user.email = email
-    user.phone = phone
+    if phone:
+        user.phone = normalize_phone(phone)
     avatar_file = request.files.get("avatar")
     if avatar_file and avatar_file.filename:
         filename = secure_filename(avatar_file.filename)
@@ -673,15 +626,12 @@ def settings_page():
 @login_required
 def update_settings():
     user = User.query.get_or_404(session["user_id"])
-
     theme = request.form.get("theme", "").strip()
     current_password = request.form.get("current_password", "").strip()
     new_password = request.form.get("new_password", "").strip()
     confirm_password = request.form.get("confirm_password", "").strip()
-
     user.language = "العربية"
     user.theme = theme if theme else "light"
-
     if current_password or new_password or confirm_password:
         if not current_password or not new_password or not confirm_password:
             flash("لتغيير كلمة المرور يجب تعبئة جميع حقول كلمة المرور", "error")
@@ -693,7 +643,6 @@ def update_settings():
             flash("كلمتا المرور الجديدتان غير متطابقتين", "error")
             return redirect(url_for("settings_page"))
         user.password = generate_password_hash(new_password)
-
     db.session.commit()
     flash("تم تحديث الإعدادات بنجاح", "success")
     return redirect(url_for("settings_page"))
@@ -708,10 +657,8 @@ def support_page():
         if not name or not email or not issue_type or not message:
             flash("يرجى تعبئة جميع الحقول", "error")
             return redirect(url_for("support_page"))
-        new_message = SupportMessage(
-            name=name, email=email, issue_type=issue_type, message=message,
-            user_id=session.get("user_id")
-        )
+        new_message = SupportMessage(name=name, email=email, issue_type=issue_type, message=message,
+                                     user_id=session.get("user_id"))
         db.session.add(new_message)
         db.session.commit()
         flash("تم إرسال رسالتك بنجاح، وسيتم الرد عليك من داخل الموقع", "success")
@@ -786,184 +733,62 @@ def notifications_page():
 @app.route("/admin-notifications")
 @admin_required
 def admin_notifications_page():
-    notifications = SupportMessage.query.order_by(
-        SupportMessage.id.desc()
-    ).all()
-
+    notifications = SupportMessage.query.order_by(SupportMessage.id.desc()).all()
     new_messages = SupportMessage.query.filter_by(status="جديدة").all()
-
     for msg in new_messages:
         msg.status = "مقروءة"
-
     if new_messages:
         db.session.commit()
-
-    return render_template(
-        "admin_notifications.html",
-        notifications=notifications,
-        messages=notifications
-    )
+    return render_template("admin_notifications.html", notifications=notifications, messages=notifications)
 
 @app.route("/search-suggestions")
 def search_suggestions():
     query = request.args.get("q", "").strip().lower()
     if not query:
         return jsonify([])
-
     user = get_current_user()
     results = []
-
     static_pages = [
-        {
-            "title": "الرئيسية",
-            "subtitle": "الانتقال إلى الصفحة الرئيسية",
-            "status": "صفحة",
-            "url": url_for("home"),
-            "keywords": ["الرئيسية", "home", "الصفحة الرئيسية"]
-        },
-        {
-            "title": "من نحن",
-            "subtitle": "التعريف بالمنصة وأهدافها",
-            "status": "صفحة",
-            "url": url_for("about"),
-            "keywords": ["من نحن", "عن الفريق", "نبذة", "تعريف"]
-        },
-        {
-            "title": "عن المنصة",
-            "subtitle": "معلومات عن منصة أبلغ وآلية عملها",
-            "status": "صفحة",
-            "url": url_for("about_us"),
-            "keywords": ["عن المنصة", "المنصة", "أبلغ", "الية العمل", "آلية العمل"]
-        },
+        {"title": "الرئيسية", "subtitle": "الانتقال إلى الصفحة الرئيسية", "status": "صفحة", "url": url_for("home"), "keywords": ["الرئيسية", "home", "الصفحة الرئيسية"]},
+        {"title": "من نحن", "subtitle": "التعريف بالمنصة وأهدافها", "status": "صفحة", "url": url_for("about"), "keywords": ["من نحن", "عن الفريق", "نبذة", "تعريف"]},
+        {"title": "عن المنصة", "subtitle": "معلومات عن منصة أبلغ وآلية عملها", "status": "صفحة", "url": url_for("about_us"), "keywords": ["عن المنصة", "المنصة", "أبلغ", "الية العمل", "آلية العمل"]},
     ]
-
     if user:
         static_pages.extend([
-            {
-                "title": "ملفي الشخصي",
-                "subtitle": "عرض وتعديل بيانات الحساب",
-                "status": "حساب",
-                "url": url_for("profile_page"),
-                "keywords": ["ملفي الشخصي", "الملف الشخصي", "الملف", "البروفايل", "profile"]
-            },
-            {
-                "title": "الإعدادات",
-                "subtitle": "تعديل الثيم وكلمة المرور",
-                "status": "إعدادات",
-                "url": url_for("settings_page"),
-                "keywords": ["الإعدادات", "اعدادات", "الثيم", "كلمة المرور", "settings"]
-            },
+            {"title": "ملفي الشخصي", "subtitle": "عرض وتعديل بيانات الحساب", "status": "حساب", "url": url_for("profile_page"), "keywords": ["ملفي الشخصي", "الملف الشخصي", "الملف", "البروفايل", "profile"]},
+            {"title": "الإعدادات", "subtitle": "تعديل الثيم وكلمة المرور", "status": "إعدادات", "url": url_for("settings_page"), "keywords": ["الإعدادات", "اعدادات", "الثيم", "كلمة المرور", "settings"]},
         ])
-
         if user.email.lower() == ADMIN_EMAIL.lower():
             static_pages.extend([
-                {
-                    "title": "لوحة التحكم",
-                    "subtitle": "إدارة البلاغات والمستخدمين",
-                    "status": "أدمن",
-                    "url": url_for("dashboard"),
-                    "keywords": ["لوحة التحكم", "لوحة الادمن", "لوحة الأدمن", "البلاغات", "المستخدمين", "dashboard"]
-                },
-                {
-                    "title": "رسائل الدعم",
-                    "subtitle": "عرض رسائل الدعم المرسلة من المستخدمين",
-                    "status": "أدمن",
-                    "url": url_for("admin_support"),
-                    "keywords": ["رسائل الدعم", "الدعم", "الدعم الفني", "admin support"]
-                },
-                {
-                    "title": "إشعارات الأدمن",
-                    "subtitle": "عرض إشعارات ورسائل الدعم الجديدة",
-                    "status": "أدمن",
-                    "url": url_for("admin_notifications_page"),
-                    "keywords": ["إشعارات", "اشعارات", "إشعارات الأدمن", "جرس", "notifications"]
-                },
+                {"title": "لوحة التحكم", "subtitle": "إدارة البلاغات والمستخدمين", "status": "أدمن", "url": url_for("dashboard"), "keywords": ["لوحة التحكم", "لوحة الادمن", "لوحة الأدمن", "البلاغات", "المستخدمين", "dashboard"]},
+                {"title": "رسائل الدعم", "subtitle": "عرض رسائل الدعم المرسلة من المستخدمين", "status": "أدمن", "url": url_for("admin_support"), "keywords": ["رسائل الدعم", "الدعم", "الدعم الفني", "admin support"]},
+                {"title": "إشعارات الأدمن", "subtitle": "عرض إشعارات ورسائل الدعم الجديدة", "status": "أدمن", "url": url_for("admin_notifications_page"), "keywords": ["إشعارات", "اشعارات", "إشعارات الأدمن", "جرس", "notifications"]},
             ])
         else:
             static_pages.extend([
-                {
-                    "title": "تقديم بلاغ",
-                    "subtitle": "اختيار نوع البلاغ وإرساله",
-                    "status": "بلاغ",
-                    "url": url_for("report_page"),
-                    "keywords": ["تقديم بلاغ", "بلاغ", "ارسال بلاغ", "إرسال بلاغ", "report"]
-                },
-                {
-                    "title": "بلاغاتي",
-                    "subtitle": "عرض جميع البلاغات الخاصة بك",
-                    "status": "بلاغ",
-                    "url": url_for("my_reports"),
-                    "keywords": ["بلاغاتي", "بلاغاتي الخاصة", "تقاريري", "my reports"]
-                },
-                {
-                    "title": "الدعم الفني",
-                    "subtitle": "إرسال رسالة للدعم ومتابعة الردود",
-                    "status": "دعم",
-                    "url": url_for("support_page"),
-                    "keywords": ["الدعم الفني", "الدعم", "رسالة", "مساعدة", "support"]
-                },
-                {
-                    "title": "الإشعارات",
-                    "subtitle": "عرض الردود والإشعارات الجديدة",
-                    "status": "إشعارات",
-                    "url": url_for("notifications_page"),
-                    "keywords": ["الإشعارات", "اشعارات", "جرس", "notifications"]
-                },
+                {"title": "تقديم بلاغ", "subtitle": "اختيار نوع البلاغ وإرساله", "status": "بلاغ", "url": url_for("report_page"), "keywords": ["تقديم بلاغ", "بلاغ", "ارسال بلاغ", "إرسال بلاغ", "report"]},
+                {"title": "بلاغاتي", "subtitle": "عرض جميع البلاغات الخاصة بك", "status": "بلاغ", "url": url_for("my_reports"), "keywords": ["بلاغاتي", "بلاغاتي الخاصة", "تقاريري", "my reports"]},
+                {"title": "الدعم الفني", "subtitle": "إرسال رسالة للدعم ومتابعة الردود", "status": "دعم", "url": url_for("support_page"), "keywords": ["الدعم الفني", "الدعم", "رسالة", "مساعدة", "support"]},
+                {"title": "الإشعارات", "subtitle": "عرض الردود والإشعارات الجديدة", "status": "إشعارات", "url": url_for("notifications_page"), "keywords": ["الإشعارات", "اشعارات", "جرس", "notifications"]},
             ])
     else:
         static_pages.extend([
-            {
-                "title": "تسجيل الدخول",
-                "subtitle": "الدخول إلى الحساب",
-                "status": "حساب",
-                "url": url_for("login_page"),
-                "keywords": ["تسجيل الدخول", "دخول", "login"]
-            },
-            {
-                "title": "إنشاء حساب",
-                "subtitle": "تسجيل مستخدم جديد",
-                "status": "حساب",
-                "url": url_for("register_page"),
-                "keywords": ["إنشاء حساب", "تسجيل", "حساب جديد", "register"]
-            },
+            {"title": "تسجيل الدخول", "subtitle": "الدخول إلى الحساب", "status": "حساب", "url": url_for("login_page"), "keywords": ["تسجيل الدخول", "دخول", "login"]},
+            {"title": "إنشاء حساب", "subtitle": "تسجيل مستخدم جديد", "status": "حساب", "url": url_for("register_page"), "keywords": ["إنشاء حساب", "تسجيل", "حساب جديد", "register"]},
         ])
-
     for page in static_pages:
         searchable_text = " ".join([page["title"], page["subtitle"]] + page["keywords"]).lower()
         if query in searchable_text:
-            results.append({
-                "title": page["title"],
-                "subtitle": page["subtitle"],
-                "status": page["status"],
-                "url": page["url"]
-            })
-
-    reports = (
-        db.session.query(Report, User)
-        .outerjoin(User, Report.user_id == User.id)
-        .filter(
-            or_(
-                cast(Report.id, String).ilike(f"%{query}%"),
-                Report.type.ilike(f"%{query}%"),
-                Report.description.ilike(f"%{query}%"),
-                Report.status.ilike(f"%{query}%"),
-                User.name.ilike(f"%{query}%"),
-                User.email.ilike(f"%{query}%")
-            )
-        )
-        .limit(6)
-        .all()
-    )
-
+            results.append({"title": page["title"], "subtitle": page["subtitle"], "status": page["status"], "url": page["url"]})
+    reports = db.session.query(Report, User).outerjoin(User, Report.user_id == User.id).filter(
+        or_(cast(Report.id, String).ilike(f"%{query}%"), Report.type.ilike(f"%{query}%"),
+            Report.description.ilike(f"%{query}%"), Report.status.ilike(f"%{query}%"),
+            User.name.ilike(f"%{query}%"), User.email.ilike(f"%{query}%"))
+    ).limit(6).all()
     for report, report_user in reports:
         owner_name = report_user.name if report_user else "مستخدم"
-        results.append({
-            "title": f"بلاغ رقم {report.id} - {report.type}",
-            "subtitle": f"{report.description[:60]} | مقدم البلاغ: {owner_name}",
-            "status": report.status,
-            "url": url_for("details", report_id=report.id) if user and user.email.lower() == ADMIN_EMAIL.lower() else url_for("my_reports")
-        })
-
+        results.append({"title": f"بلاغ رقم {report.id} - {report.type}", "subtitle": f"{report.description[:60]} | مقدم البلاغ: {owner_name}",
+                        "status": report.status, "url": url_for("details", report_id=report.id) if user and user.email.lower() == ADMIN_EMAIL.lower() else url_for("my_reports")})
     unique_results = []
     seen = set()
     for item in results:
@@ -971,7 +796,6 @@ def search_suggestions():
         if key not in seen:
             seen.add(key)
             unique_results.append(item)
-
     return jsonify(unique_results[:8])
 
 @app.route("/logout")
@@ -981,7 +805,7 @@ def logout():
     return redirect(url_for("login_page"))
 
 # ------------------------------
-# Call Report Routes (Twilio webhooks)
+# Call Report Routes (Twilio webhooks) - FIXED with phone normalization
 # ------------------------------
 @app.route("/save-location", methods=["POST"])
 @login_required
@@ -998,40 +822,64 @@ def save_location():
 @app.route("/initiate-call-report", methods=["POST"])
 @login_required
 def initiate_call_report():
-    data = request.get_json()
-    report_type = data.get("type")
-    if not report_type:
-        return jsonify({"error": "نوع البلاغ مطلوب"}), 400
-    user = get_current_user()
-    if not user.phone:
-        return jsonify({"error": "رقم الهاتف غير موجود. يرجى إضافته في الملف الشخصي."}), 400
-    lat = session.get("temp_lat")
-    lng = session.get("temp_lng")
-    if not lat or not lng:
-        return jsonify({"error": "يرجى تحديد موقعك باستخدام زر 'إرسال الموقع الحالي' أولاً"}), 400
-    call_report = CallReport(
-        user_id=user.id,
-        report_type=report_type,
-        location_lat=lat,
-        location_lng=lng,
-        status="pending"
-    )
-    db.session.add(call_report)
-    db.session.commit()
+    """Initiate a Twilio call to the user for voice reporting."""
     try:
+        data = request.get_json()
+        report_type = data.get("type")
+        if not report_type:
+            return jsonify({"error": "نوع البلاغ مطلوب"}), 400
+
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "يجب تسجيل الدخول"}), 401
+
+        if not user.phone:
+            return jsonify({"error": "رقم الهاتف غير موجود. يرجى إضافته في الملف الشخصي."}), 400
+
+        # Normalize user phone again (in case it's stored incorrectly)
+        user_phone = normalize_phone(user.phone)
+        if not user_phone:
+            return jsonify({"error": "رقم الهاتف غير صالح. يرجى تحديثه بصيغة دولية."}), 400
+
+        lat = session.get("temp_lat")
+        lng = session.get("temp_lng")
+        if not lat or not lng:
+            return jsonify({"error": "يرجى تحديد موقعك باستخدام زر 'إرسال الموقع الحالي' أولاً"}), 400
+
+        # Create call report in database
+        call_report = CallReport(
+            user_id=user.id,
+            report_type=report_type,
+            location_lat=lat,
+            location_lng=lng,
+            status="pending"
+        )
+        db.session.add(call_report)
+        db.session.commit()
+
         if not twilio_client:
-            return jsonify({"error": "Twilio not configured"}), 500
+            return jsonify({"error": "خدمة المكالمات غير متاحة حالياً (Twilio غير مهيأ)"}), 500
+
+        # Make the call using normalized number
         call = twilio_client.calls.create(
             url=url_for("voice_webhook", report_id=call_report.id, _external=True),
-            to=user.phone,
+            to=user_phone,
             from_=TWILIO_PHONE_NUMBER,
             timeout=30
         )
         call_report.call_sid = call.sid
         db.session.commit()
         return jsonify({"success": True, "message": "جاري الاتصال بك...", "call_id": call_report.id})
+
+    except TwilioRestException as e:
+        error_msg = f"خطأ في Twilio: {e.msg}"
+        print(error_msg)
+        print(traceback.format_exc())
+        return jsonify({"error": error_msg}), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error in initiate_call_report: {e}")
+        print(traceback.format_exc())
+        return jsonify({"error": f"حدث خطأ: {str(e)}"}), 500
 
 @app.route("/voice-webhook/<int:report_id>", methods=["POST"])
 def voice_webhook(report_id):
@@ -1119,12 +967,12 @@ def voice_incoming():
     return str(response)
 
 # ------------------------------
-# Emergency Voice Report (chatbot)
+# Emergency Voice Report (chatbot) - FIXED storage
 # ------------------------------
 @app.route("/emergency-voice-report", methods=["POST"])
 @login_required
 def emergency_voice_report():
-    """Receive audio from chatbot, transcribe with Whisper, detect emergency, call support agent."""
+    """Receive audio from chatbot, transcribe, detect emergency, call support agent."""
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file provided"}), 400
 
@@ -1132,7 +980,7 @@ def emergency_voice_report():
     if audio_file.filename == '':
         return jsonify({"error": "Empty audio file"}), 400
 
-    # Save audio temporarily (webm format)
+    # Save audio temporarily
     temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix='.webm')
     audio_file.save(temp_audio.name)
     temp_audio.close()
@@ -1140,12 +988,10 @@ def emergency_voice_report():
     transcript = ""
     category = "عام"
     try:
-        # Whisper can read webm directly if ffmpeg is installed
         transcript = transcribe_audio_with_whisper(temp_audio.name)
         category = classify_problem(transcript)
     except Exception as e:
         print(f"❌ Transcription error: {e}")
-        import traceback
         traceback.print_exc()
         os.unlink(temp_audio.name)
         return jsonify({"error": f"فشل التعرف على الصوت: {str(e)}", "transcript": ""}), 500
@@ -1159,69 +1005,83 @@ def emergency_voice_report():
         "emergency": category != "عام"
     }
 
+    # Save emergency call record BEFORE any Twilio attempt
+    user = get_current_user()
+    lat = session.get("temp_lat")
+    lng = session.get("temp_lng")
+    location_str = f"lat:{lat},lng:{lng}" if lat and lng else None
+
+    emergency = EmergencyCall(
+        user_id=user.id if user else None,
+        problem_category=category,
+        transcript=transcript,
+        location=location_str,
+        status="initiated"
+    )
+    db.session.add(emergency)
+    db.session.commit()  # Force commit so record persists even if later steps fail
+    response_data["emergency_id"] = emergency.id
+    print(f"✅ EmergencyCall record {emergency.id} saved to database.")
+
     # If emergency, initiate call to support agent
     if category != "عام" and SUPPORT_AGENT_NUMBER and twilio_client:
-        user = get_current_user()
-        location_str = ""
-        lat = session.get("temp_lat")
-        lng = session.get("temp_lng")
-        if lat and lng:
-            location_str = f"الموقع: خط العرض {lat}, خط الطول {lng}. "
+        location_text = f"الموقع: خط العرض {lat}, خط الطول {lng}. " if lat and lng else ""
         message_body = (
             f"تنبيه طوارئ: تم استلام بلاغ صوتي من المستخدم {user.name if user else 'مجهول'} "
-            f"يصف مشكلة من نوع {category}. {location_str}"
+            f"يصف مشكلة من نوع {category}. {location_text}"
             f"النص: {transcript[:150]}..."
         )
         try:
+            # Normalize support agent number just in case
+            agent_number = normalize_phone(SUPPORT_AGENT_NUMBER)
             call = twilio_client.calls.create(
-                to=SUPPORT_AGENT_NUMBER,
+                to=agent_number,
                 from_=TWILIO_PHONE_NUMBER,
                 twiml=f'<Response><Say voice="woman" language="ar">{message_body}</Say></Response>'
             )
-            emergency = EmergencyCall(
-                user_id=user.id if user else None,
-                problem_category=category,
-                transcript=transcript,
-                location=f"lat:{lat},lng:{lng}" if lat and lng else None,
-                call_sid=call.sid,
-                status="completed"
-            )
-            db.session.add(emergency)
+            emergency.call_sid = call.sid
+            emergency.status = "completed"
             db.session.commit()
             response_data["call_initiated"] = True
             response_data["call_sid"] = call.sid
-        except Exception as e:
+            print(f"✅ Twilio call initiated: {call.sid}")
+        except TwilioRestException as e:
             print(f"Twilio call error: {e}")
+            emergency.status = "failed"
+            db.session.commit()
+            response_data["call_initiated"] = False
+            response_data["call_error"] = f"خطأ Twilio: {e.msg}"
+        except Exception as e:
+            print(f"General error: {e}")
+            emergency.status = "failed"
+            db.session.commit()
             response_data["call_initiated"] = False
             response_data["call_error"] = str(e)
     else:
         response_data["call_initiated"] = False
+        if not SUPPORT_AGENT_NUMBER:
+            response_data["call_error"] = "رقم الدعم غير مهيأ"
+        elif not twilio_client:
+            response_data["call_error"] = "خدمة المكالمات غير متاحة"
 
     return jsonify(response_data)
 
 # ------------------------------
-# Database initialization (FIXED)
+# Database initialization
 # ------------------------------
 with app.app_context():
-    # Ensure instance folder exists
     instance_dir = os.path.dirname(db_path)
     os.makedirs(instance_dir, exist_ok=True)
-
-    # Create all tables
     db.create_all()
     print("✅ Database tables created (or already exist).")
-
-    # Run column repairs (safe, only if tables exist)
     ensure_columns()
-
-    # Ensure admin user has admin flag
     admin = User.query.filter_by(email=ADMIN_EMAIL).first()
     if admin and not admin.is_admin:
         admin.is_admin = True
         db.session.commit()
         print(f"✅ Admin flag set for {ADMIN_EMAIL}")
     elif not admin:
-        print(f"⚠️ Admin user {ADMIN_EMAIL} not found in database. Please register first.")
+        print(f"⚠️ Admin user {ADMIN_EMAIL} not found. Please register first.")
 
 # ------------------------------
 # Run the app

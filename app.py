@@ -84,7 +84,7 @@ app.config["MAIL_DEFAULT_SENDER"] = "ablgah.official@gmail.com"
 # Twilio settings
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+16062303912")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+17402652607")
 SUPPORT_AGENT_NUMBER = os.getenv("SUPPORT_AGENT_NUMBER")
 # Normalize support agent number immediately
 if SUPPORT_AGENT_NUMBER:

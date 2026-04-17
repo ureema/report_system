@@ -221,8 +221,13 @@ def inject_user_preferences():
     }
 
 # ------------------------------
-# Automatic database column repair
+# Automatic database column repair (safe version)
 # ------------------------------
+def table_exists(conn, table_name):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+    return cursor.fetchone() is not None
+
 def ensure_columns():
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance', 'database.db')
     if not os.path.exists(db_path):
@@ -230,24 +235,35 @@ def ensure_columns():
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(report)")
-        cols = [c[1] for c in cursor.fetchall()]
-        if 'created_at' not in cols:
-            cursor.execute("ALTER TABLE report ADD COLUMN created_at TIMESTAMP")
-            conn.commit()
-            print("✅ Added created_at to report")
-        cursor.execute("PRAGMA table_info(support_message)")
-        cols = [c[1] for c in cursor.fetchall()]
-        if 'created_at' not in cols:
-            cursor.execute("ALTER TABLE support_message ADD COLUMN created_at TIMESTAMP")
-            conn.commit()
-            print("✅ Added created_at to support_message")
-        cursor.execute("PRAGMA table_info(call_report)")
-        cols = [c[1] for c in cursor.fetchall()] if cursor.fetchone() else []
-        if 'report_type' not in cols:
-            cursor.execute("ALTER TABLE call_report ADD COLUMN report_type VARCHAR(50) NOT NULL DEFAULT ''")
-            conn.commit()
-            print("✅ Added report_type to call_report")
+
+        # Report table
+        if table_exists(conn, "report"):
+            cursor.execute("PRAGMA table_info(report)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'created_at' not in cols:
+                cursor.execute("ALTER TABLE report ADD COLUMN created_at TIMESTAMP")
+                conn.commit()
+                print("✅ Added created_at to report")
+
+        # SupportMessage table
+        if table_exists(conn, "support_message"):
+            cursor.execute("PRAGMA table_info(support_message)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'created_at' not in cols:
+                cursor.execute("ALTER TABLE support_message ADD COLUMN created_at TIMESTAMP")
+                conn.commit()
+                print("✅ Added created_at to support_message")
+
+        # CallReport table
+        if table_exists(conn, "call_report"):
+            cursor.execute("PRAGMA table_info(call_report)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'report_type' not in cols:
+                cursor.execute("ALTER TABLE call_report ADD COLUMN report_type VARCHAR(50) NOT NULL DEFAULT ''")
+                conn.commit()
+                print("✅ Added report_type to call_report")
+
+        # EmergencyCall table (always ensure it exists)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS emergency_call (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,13 +282,8 @@ def ensure_columns():
     except Exception as e:
         print(f"Column ensure warning: {e}")
 
-ensure_columns()
-
 # ------------------------------
-# Routes (all existing routes are here – same as before)
-# I'll include them for completeness, but they are identical to your working version.
-# To save space, I'll assume you have them. The critical addition is the emergency-voice-report route.
-# However, I'll provide the full route list.
+# Routes (all existing routes)
 # ------------------------------
 
 @app.route("/")
@@ -282,6 +293,7 @@ def home():
 @app.route("/login", methods=["GET"])
 def login_page():
     return render_template("login.html")
+
 @app.route("/login", methods=["POST"])
 def login():
     identifier = request.form.get("identifier", "").strip()
@@ -616,7 +628,6 @@ def delete_report(report_id):
     db.session.commit()
     flash("تم حذف البلاغ بنجاح", "success")
     return redirect(url_for("dashboard"))
-
 
 @app.route("/profile", methods=["GET"])
 @login_required
@@ -1108,7 +1119,7 @@ def voice_incoming():
     return str(response)
 
 # ------------------------------
-# Emergency Voice Report (chatbot) – FIXED
+# Emergency Voice Report (chatbot)
 # ------------------------------
 @app.route("/emergency-voice-report", methods=["POST"])
 @login_required
@@ -1189,14 +1200,31 @@ def emergency_voice_report():
     return jsonify(response_data)
 
 # ------------------------------
+# Database initialization (FIXED)
+# ------------------------------
+with app.app_context():
+    # Ensure instance folder exists
+    instance_dir = os.path.dirname(db_path)
+    os.makedirs(instance_dir, exist_ok=True)
+
+    # Create all tables
+    db.create_all()
+    print("✅ Database tables created (or already exist).")
+
+    # Run column repairs (safe, only if tables exist)
+    ensure_columns()
+
+    # Ensure admin user has admin flag
+    admin = User.query.filter_by(email=ADMIN_EMAIL).first()
+    if admin and not admin.is_admin:
+        admin.is_admin = True
+        db.session.commit()
+        print(f"✅ Admin flag set for {ADMIN_EMAIL}")
+    elif not admin:
+        print(f"⚠️ Admin user {ADMIN_EMAIL} not found in database. Please register first.")
+
+# ------------------------------
 # Run the app
 # ------------------------------
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
-        admin = User.query.filter_by(email=ADMIN_EMAIL).first()
-        if admin and not admin.is_admin:
-            admin.is_admin = True
-            db.session.commit()
-            print(f"✅ تم تحويل {admin.email} لأدمن تلقائياً")
     app.run(host='0.0.0.0', port=5000, debug=True)

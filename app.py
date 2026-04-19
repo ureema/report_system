@@ -28,7 +28,7 @@ from flask_mail import Mail, Message
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.base.exceptions import TwilioRestException
 import assemblyai as aai
 
@@ -39,25 +39,20 @@ load_dotenv()
 # Helper: normalize phone to E.164
 # ------------------------------
 def normalize_phone(phone: str) -> str:
-    """Convert local/international numbers to E.164 format (+962...)."""
     if not phone:
         return ""
-    # Remove all non-digit characters
     digits = re.sub(r"\D", "", phone)
     if not digits:
         return ""
-    # If already starts with '+' and has 10-15 digits, return as is (basic validation)
     if phone.startswith("+") and len(digits) >= 10:
         return phone
-    # Handle 00962... or 962... or 0...
     if digits.startswith("00962"):
-        digits = digits[2:]  # remove 00 -> +962...
+        digits = digits[2:]
     elif digits.startswith("962"):
         digits = "962" + digits[3:] if len(digits) > 3 else digits
     elif digits.startswith("0"):
-        digits = "962" + digits[1:]  # remove leading 0, add 962
+        digits = "962" + digits[1:]
     else:
-        # Assume it's a local number without country code – add +962
         digits = "962" + digits
     return f"+{digits}"
 
@@ -67,13 +62,11 @@ def normalize_phone(phone: str) -> str:
 app = Flask(__name__)
 app.secret_key = "secret123"
 
-# Database – use the instance folder
 db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance', 'database.db')
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["UPLOAD_FOLDER"] = os.path.join("static", "uploads")
 
-# Mail settings
 app.config["MAIL_SERVER"] = "smtp.gmail.com"
 app.config["MAIL_PORT"] = 587
 app.config["MAIL_USE_TLS"] = True
@@ -81,21 +74,20 @@ app.config["MAIL_USERNAME"] = "ablgah.official@gmail.com"
 app.config["MAIL_PASSWORD"] = "ollgvdgnfkqodscc"
 app.config["MAIL_DEFAULT_SENDER"] = "ablgah.official@gmail.com"
 
-# Twilio settings
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+17402652607")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+16062303912")
 SUPPORT_AGENT_NUMBER = os.getenv("SUPPORT_AGENT_NUMBER")
-# Normalize support agent number immediately
 if SUPPORT_AGENT_NUMBER:
     SUPPORT_AGENT_NUMBER = normalize_phone(SUPPORT_AGENT_NUMBER)
 
-# AssemblyAI (optional fallback)
+# Public base URL (for Twilio callbacks). Set this in .env if needed.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
 AAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 if AAI_API_KEY:
     aai.settings.api_key = AAI_API_KEY
 
-# Initialize extensions
 db = SQLAlchemy(app)
 mail = Mail(app)
 serializer = URLSafeTimedSerializer(app.secret_key)
@@ -110,6 +102,10 @@ os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
 ADMIN_EMAIL = "reemasaad756@gmail.com"
 
+# Arabic voice for Twilio (Amazon Polly - female Arabic)
+ARABIC_VOICE = "Polly.Zeina"
+ARABIC_LANG = "arb"
+
 # Load Whisper model once
 whisper_model = None
 try:
@@ -118,15 +114,29 @@ try:
 except Exception as e:
     print(f"⚠️ Could not load Whisper model: {e}")
 
-# Helper: transcribe with Whisper
 def transcribe_audio_with_whisper(audio_path):
     if whisper_model is None:
         raise Exception("Whisper model not loaded")
     result = whisper_model.transcribe(audio_path, language="ar", fp16=False)
     return result["text"].strip()
 
+def get_public_url(path):
+    """Return a public URL for Twilio callbacks. Prefers PUBLIC_BASE_URL env var."""
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}{path}"
+    # Fallback to Flask's url_for with _external
+    return url_for_external_fallback(path)
+
+def url_for_external_fallback(path):
+    """If called within request context, build external URL."""
+    try:
+        from flask import request as _req
+        return f"{_req.url_root.rstrip('/')}{path}"
+    except Exception:
+        return path
+
 # ------------------------------
-# Database Models (unchanged)
+# Database Models
 # ------------------------------
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -243,9 +253,6 @@ def inject_user_preferences():
         "unread_admin_support_count": unread_admin_support_count
     }
 
-# ------------------------------
-# Database column repair (safe)
-# ------------------------------
 def table_exists(conn, table_name):
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
@@ -295,7 +302,7 @@ def ensure_columns():
         print(f"Column ensure warning: {e}")
 
 # ------------------------------
-# All existing routes (unchanged except phone normalization in registration)
+# Routes
 # ------------------------------
 @app.route("/")
 def home():
@@ -353,7 +360,6 @@ def register():
     if not name or not email or not phone or not password:
         flash("يرجى تعبئة جميع الحقول", "error")
         return redirect(url_for("register_page"))
-    # Normalize phone before saving
     phone = normalize_phone(phone)
     if User.query.filter_by(email=email).first():
         flash("هذا البريد مسجل من قبل", "error")
@@ -805,7 +811,7 @@ def logout():
     return redirect(url_for("login_page"))
 
 # ------------------------------
-# Call Report Routes (Twilio webhooks) - FIXED with phone normalization
+# CALL REPORT ROUTES - REWORKED
 # ------------------------------
 @app.route("/save-location", methods=["POST"])
 @login_required
@@ -822,7 +828,10 @@ def save_location():
 @app.route("/initiate-call-report", methods=["POST"])
 @login_required
 def initiate_call_report():
-    """Initiate a Twilio call to the user for voice reporting."""
+    """Initiate a Twilio call to the user for voice reporting.
+    Since Twilio phone number's webhook is configured to /voice-incoming,
+    we pass the report_id via URL params so /voice-incoming knows the context.
+    """
     try:
         data = request.get_json()
         report_type = data.get("type")
@@ -836,7 +845,6 @@ def initiate_call_report():
         if not user.phone:
             return jsonify({"error": "رقم الهاتف غير موجود. يرجى إضافته في الملف الشخصي."}), 400
 
-        # Normalize user phone again (in case it's stored incorrectly)
         user_phone = normalize_phone(user.phone)
         if not user_phone:
             return jsonify({"error": "رقم الهاتف غير صالح. يرجى تحديثه بصيغة دولية."}), 400
@@ -846,7 +854,6 @@ def initiate_call_report():
         if not lat or not lng:
             return jsonify({"error": "يرجى تحديد موقعك باستخدام زر 'إرسال الموقع الحالي' أولاً"}), 400
 
-        # Create call report in database
         call_report = CallReport(
             user_id=user.id,
             report_type=report_type,
@@ -860,9 +867,12 @@ def initiate_call_report():
         if not twilio_client:
             return jsonify({"error": "خدمة المكالمات غير متاحة حالياً (Twilio غير مهيأ)"}), 500
 
-        # Make the call using normalized number
+        # Build the webhook URL. Use PUBLIC_BASE_URL if set, otherwise rely on request url_root
+        base_url = PUBLIC_BASE_URL if PUBLIC_BASE_URL else request.url_root.rstrip("/")
+        webhook_url = f"{base_url}/voice-incoming?report_id={call_report.id}"
+
         call = twilio_client.calls.create(
-            url=url_for("voice_webhook", report_id=call_report.id, _external=True),
+            url=webhook_url,
             to=user_phone,
             from_=TWILIO_PHONE_NUMBER,
             timeout=30
@@ -881,22 +891,87 @@ def initiate_call_report():
         print(traceback.format_exc())
         return jsonify({"error": f"حدث خطأ: {str(e)}"}), 500
 
-@app.route("/voice-webhook/<int:report_id>", methods=["POST"])
-def voice_webhook(report_id):
+
+@app.route("/voice-incoming", methods=["GET", "POST"])
+def voice_incoming():
+    """
+    Unified entry point for Twilio calls.
+    - If called with ?report_id=XX (from initiate_call_report), it plays the
+      report-gathering flow: greets in Arabic, asks user to press any key, then records.
+    - Otherwise (inbound call without context), it plays a generic Arabic greeting.
+    """
+    report_id = request.args.get("report_id") or request.form.get("report_id")
     response = VoiceResponse()
-    response.say("مرحباً، هذه منصة أبلغ. بعد سماع صوت التنبيه، سجل رسالتك بوضوح.", voice="woman")
+
+    if report_id:
+        # Outbound call flow for a specific report
+        base_url = PUBLIC_BASE_URL if PUBLIC_BASE_URL else request.url_root.rstrip("/")
+
+        # Greet in Arabic and ask user to press any key to begin recording
+        gather = Gather(
+            num_digits=1,
+            timeout=10,
+            action=f"{base_url}/voice-start-recording?report_id={report_id}",
+            method="POST",
+            language=ARABIC_LANG
+        )
+        gather.say(
+            "مرحباً بك في منصة أبلغ. "
+            "لتسجيل بلاغك الصوتي، يرجى الضغط على أي رقم من لوحة المفاتيح للبدء بالتسجيل.",
+            voice=ARABIC_VOICE,
+            language=ARABIC_LANG
+        )
+        response.append(gather)
+
+        # If no key pressed, retry once
+        response.say(
+            "لم نستقبل أي مدخل. شكراً لاتصالك بمنصة أبلغ. مع السلامة.",
+            voice=ARABIC_VOICE,
+            language=ARABIC_LANG
+        )
+        response.hangup()
+    else:
+        # Generic inbound call
+        response.say(
+            "مرحباً بك في منصة أبلغ. الرجاء تسجيل الدخول إلى الموقع لاستخدام خدمة المكالمات.",
+            voice=ARABIC_VOICE,
+            language=ARABIC_LANG
+        )
+        response.hangup()
+
+    return str(response), 200, {'Content-Type': 'text/xml'}
+
+
+@app.route("/voice-start-recording", methods=["POST"])
+def voice_start_recording():
+    """After user presses a key, prompt them and start recording."""
+    report_id = request.args.get("report_id") or request.form.get("report_id")
+    response = VoiceResponse()
+
+    base_url = PUBLIC_BASE_URL if PUBLIC_BASE_URL else request.url_root.rstrip("/")
+
+    response.say(
+        "بعد سماع صوت التنبيه، يرجى وصف البلاغ بوضوح، ثم اضغط على مفتاح المربع للإنهاء أو انتظر حتى انتهاء المدة.",
+        voice=ARABIC_VOICE,
+        language=ARABIC_LANG
+    )
     response.record(
-        action=url_for("process_recording", report_id=report_id, _external=True),
+        action=f"{base_url}/process-recording/{report_id}",
         method="POST",
-        max_length=55,
+        max_length=60,
         timeout=5,
         play_beep=True,
-        finish_on_key="",
+        finish_on_key="#",
         trim="trim-silence"
     )
-    response.say("لم يتم تسجيل أي رسالة. شكراً لك، مع السلامة.", voice="woman")
+    response.say(
+        "لم يتم تسجيل أي رسالة. شكراً لك، مع السلامة.",
+        voice=ARABIC_VOICE,
+        language=ARABIC_LANG
+    )
     response.hangup()
-    return str(response)
+    return str(response), 200, {'Content-Type': 'text/xml'}
+
 
 @app.route("/process-recording/<int:report_id>", methods=["POST"])
 def process_recording(report_id):
@@ -953,26 +1028,21 @@ def process_recording(report_id):
     db.session.commit()
 
     response = VoiceResponse()
-    if SUPPORT_AGENT_NUMBER:
-        response.say("شكراً لك. جاري تحويلك إلى أحد المختصين، الرجاء الانتظار.", voice="woman")
-        response.dial(SUPPORT_AGENT_NUMBER)
-    else:
-        response.say("تم استلام بلاغك بنجاح. سيتم الرد عليك لاحقاً. مع السلامة.", voice="woman")
-    return str(response)
+    response.say(
+        "تم استلام بلاغك بنجاح. سيتم مراجعته والرد عليك في أقرب وقت. شكراً لاستخدامك منصة أبلغ. مع السلامة.",
+        voice=ARABIC_VOICE,
+        language=ARABIC_LANG
+    )
+    response.hangup()
+    return str(response), 200, {'Content-Type': 'text/xml'}
 
-@app.route("/voice-incoming", methods=["POST"])
-def voice_incoming():
-    response = VoiceResponse()
-    response.say("مرحباً بك في منصة أبلغ. الرجاء تسجيل الدخول إلى الموقع لاستخدام خدمة المكالمات.", voice="woman")
-    return str(response)
 
 # ------------------------------
-# Emergency Voice Report (chatbot) - FIXED storage
+# Emergency Voice Report (chatbot)
 # ------------------------------
 @app.route("/emergency-voice-report", methods=["POST"])
 @login_required
 def emergency_voice_report():
-    """Receive audio from chatbot, transcribe, detect emergency, call support agent."""
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file provided"}), 400
 
@@ -980,7 +1050,6 @@ def emergency_voice_report():
     if audio_file.filename == '':
         return jsonify({"error": "Empty audio file"}), 400
 
-    # Save audio temporarily
     temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix='.webm')
     audio_file.save(temp_audio.name)
     temp_audio.close()
@@ -998,14 +1067,12 @@ def emergency_voice_report():
 
     os.unlink(temp_audio.name)
 
-    # Prepare response data
     response_data = {
         "transcript": transcript,
         "category": category,
         "emergency": category != "عام"
     }
 
-    # Save emergency call record BEFORE any Twilio attempt
     user = get_current_user()
     lat = session.get("temp_lat")
     lng = session.get("temp_lng")
@@ -1019,25 +1086,45 @@ def emergency_voice_report():
         status="initiated"
     )
     db.session.add(emergency)
-    db.session.commit()  # Force commit so record persists even if later steps fail
+    db.session.commit()
     response_data["emergency_id"] = emergency.id
     print(f"✅ EmergencyCall record {emergency.id} saved to database.")
 
-    # If emergency, initiate call to support agent
+    # If emergency, initiate call to support agent - in ARABIC via Polly.Zeina
     if category != "عام" and SUPPORT_AGENT_NUMBER and twilio_client:
-        location_text = f"الموقع: خط العرض {lat}, خط الطول {lng}. " if lat and lng else ""
+        user_name = user.name if user else "مستخدم مجهول"
+        location_text = ""
+        if lat and lng:
+            location_text = f" الموقع الجغرافي: خط العرض {lat}، خط الطول {lng}."
+
+        # Arabic emergency message
         message_body = (
-            f"تنبيه طوارئ: تم استلام بلاغ صوتي من المستخدم {user.name if user else 'مجهول'} "
-            f"يصف مشكلة من نوع {category}. {location_text}"
-            f"النص: {transcript[:150]}..."
+            f"تنبيه طارئ من منصة أبلغ. "
+            f"المستخدم {user_name} أبلغ عن حالة طارئة من نوع {category}. "
+            f"يرجى التعامل معها بشكل عاجل.{location_text} "
+            f"تفاصيل البلاغ: {transcript[:200]}. "
+            f"نكرر: حالة طارئة من نوع {category}، يرجى التدخل السريع."
         )
+
+        # Build proper TwiML with Arabic voice (Polly.Zeina)
+        twiml_response = (
+            f'<?xml version="1.0" encoding="UTF-8"?>'
+            f'<Response>'
+            f'<Say voice="{ARABIC_VOICE}" language="{ARABIC_LANG}">{message_body}</Say>'
+            f'<Pause length="1"/>'
+            f'<Say voice="{ARABIC_VOICE}" language="{ARABIC_LANG}">'
+            f'سيتم إعادة الرسالة مرة أخرى.'
+            f'</Say>'
+            f'<Say voice="{ARABIC_VOICE}" language="{ARABIC_LANG}">{message_body}</Say>'
+            f'</Response>'
+        )
+
         try:
-            # Normalize support agent number just in case
             agent_number = normalize_phone(SUPPORT_AGENT_NUMBER)
             call = twilio_client.calls.create(
                 to=agent_number,
                 from_=TWILIO_PHONE_NUMBER,
-                twiml=f'<Response><Say voice="woman" language="ar">{message_body}</Say></Response>'
+                twiml=twiml_response
             )
             emergency.call_sid = call.sid
             emergency.status = "completed"
@@ -1083,8 +1170,5 @@ with app.app_context():
     elif not admin:
         print(f"⚠️ Admin user {ADMIN_EMAIL} not found. Please register first.")
 
-# ------------------------------
-# Run the app
-# ------------------------------
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, debug=True)
